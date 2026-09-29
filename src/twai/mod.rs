@@ -588,8 +588,12 @@ impl EspTwaiFrame {
         // Assert that:
         // - Max DLC is 15
         // - Data length smaller than 8 must have equal DLC
-        // - Data length equal to 8 hmust ave DLC >= 8
-        if dlc > 15 || ((data_len < 8) & (dlc != data_len)) || ((data_len == 8) & (dlc < 8)) {
+        // - Data length equal to 8 must have DLC >= 8
+        // A remote frame carries no data but asks for `dlc` bytes, so only
+        // the first rule applies to it. (Upstream fixes this differently,
+        // esp-rs/esp-hal#6081; this branch stays on the 1.2.2 API.)
+        let data_dlc_mismatch = ((data_len < 8) & (dlc != data_len)) || ((data_len == 8) & (dlc < 8));
+        if dlc > 15 || (!remote_request & data_dlc_mismatch) {
             return Err(EspTwaiError::NonCompliantDlc(dlc as u8));
         }
 
