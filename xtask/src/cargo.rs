@@ -576,6 +576,12 @@ impl CargoCommandBatcher {
     }
 }
 
+impl Default for CargoCommandBatcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for CargoCommandBatcher {
     fn drop(&mut self) {}
 }
@@ -590,13 +596,12 @@ pub struct CargoToml {
     pub manifest: toml_edit::DocumentMut,
 }
 
-const DEPENDENCY_KINDS: [&'static str; 3] =
-    ["dependencies", "dev-dependencies", "build-dependencies"];
+const DEPENDENCY_KINDS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
 
 impl CargoToml {
     /// Load and parse the Cargo.toml for the specified package in the given workspace.
     pub fn new(workspace: &Path, package: Package) -> Result<Self> {
-        let package_path = workspace.join(package.to_string());
+        let package_path = workspace.join(package.directory());
         let manifest_path = package_path.join("Cargo.toml");
         if !manifest_path.exists() {
             bail!(
@@ -612,16 +617,20 @@ impl CargoToml {
     }
 
     pub fn espressif_metadata(&self) -> Option<&Table> {
-        let Some(package) = self.manifest.get("package") else {
-            return None;
-        };
-        let Some(metadata) = package.get("metadata") else {
-            return None;
-        };
-        let Some(espressif) = metadata.get("espressif") else {
-            return None;
-        };
-        Some(espressif.as_table()?)
+        let package = self.manifest.get("package")?;
+        let metadata = package.get("metadata")?;
+        let espressif = metadata.get("espressif")?;
+        espressif.as_table()
+    }
+
+    pub fn espressif_metadata_bool(&self, key: &str) -> Option<bool> {
+        self.espressif_metadata()
+            .and_then(|table| table.get(key))
+            .map(|value| {
+                value
+                    .as_bool()
+                    .unwrap_or_else(|| panic!("{key} must be a boolean"))
+            })
     }
 
     /// Create a `CargoToml` instance from a manifest string.
@@ -653,7 +662,7 @@ impl CargoToml {
 
     /// Get the absolute path to the package directory.
     pub fn package_path(&self) -> PathBuf {
-        self.workspace.join(self.package.to_string())
+        self.workspace.join(self.package.directory())
     }
 
     /// Get the absolute path to the Cargo.toml file of the package.
@@ -759,16 +768,63 @@ impl CargoToml {
                     name
                 };
 
-                if let Ok(package) = Package::from_str(name, true) {
-                    if !dependencies.contains(&package) {
-                        dependencies.push(package);
-                    }
+                if let Ok(package) = Package::from_str(name, true)
+                    && !dependencies.contains(&package)
+                {
+                    dependencies.push(package);
                 }
             }
         });
         dependencies
     }
 
+    /// Returns each in-repo dependency with its version requirement string,
+    /// across the normal, build, and target-specific dependency sections.
+    ///
+    /// `dev-dependencies` are excluded: they are not part of the published
+    /// crate, so they neither enter a released crate's dependency tree nor
+    /// constrain what downstream users resolve.
+    ///
+    /// Dependencies without a `version` (e.g. git-only) are skipped, and renamed
+    /// dependencies (`alias = { package = "real-name" }`) resolve to the real
+    /// crate. A crate may appear more than once if depended on from several
+    /// sections.
+    pub fn repo_dependency_requirements(&mut self) -> Vec<(Package, String)> {
+        let mut dependencies = Vec::new();
+        self.visit_dependencies(|_, dependency_kind, table| {
+            if dependency_kind == "dev-dependencies" {
+                return;
+            }
+            for (key, value) in table.iter() {
+                let (name, version) = match value {
+                    // package = "version"
+                    Item::Value(Value::String(version)) => (key, Some(version.value().to_string())),
+                    // package = { version = "version", package = "real-name" }
+                    Item::Value(Value::InlineTable(t)) => {
+                        let name = t.get("package").and_then(|p| p.as_str()).unwrap_or(key);
+                        let version = t.get("version").and_then(|v| v.as_str()).map(String::from);
+                        (name, version)
+                    }
+                    // [dependencies.package]
+                    // version = "version"
+                    Item::Table(t) => {
+                        let name = t.get("package").and_then(|p| p.as_str()).unwrap_or(key);
+                        let version = t.get("version").and_then(|v| v.as_str()).map(String::from);
+                        (name, version)
+                    }
+                    _ => (key, None),
+                };
+
+                if let (Ok(package), Some(version)) = (Package::from_str(name, true), version) {
+                    dependencies.push((package, version));
+                }
+            }
+        });
+        dependencies
+    }
+
+    /// Only the release commands rewrite dependency requirements.
+    #[cfg_attr(not(feature = "release"), allow(dead_code))]
     pub(crate) fn change_version_of_dependency(
         &mut self,
         package_name: &str,
@@ -778,7 +834,7 @@ impl CargoToml {
 
         self.visit_dependencies(|_, _, table| {
             // Update dependencies which specify a version:
-            match &mut table[&package_name] {
+            match &mut table[package_name] {
                 Item::Value(Value::String(table)) => {
                     // package = "version"
                     *table = Formatted::new(format_dependency_version(table.value(), version));
@@ -800,15 +856,14 @@ impl CargoToml {
                 Item::None => {
                     // alias = { package = "foo", version = "version" }
                     let update_renamed_dep = table.get_values().iter().find_map(|(k, p)| {
-                        if let Value::InlineTable(table) = p {
-                            if let Some(Value::String(name)) = &table.get("package") {
-                                if name.value() == &package_name {
-                                    // Return the actual key of this dependency, e.g.:
-                                    // `procmacros = { package = "esp-hal-procmacros" }`
-                                    //  ^^^^^^^^^^
-                                    return Some(k.last().unwrap().get().to_string());
-                                }
-                            }
+                        if let Value::InlineTable(table) = p
+                            && let Some(Value::String(name)) = &table.get("package")
+                            && name.value() == package_name
+                        {
+                            // Return the actual key of this dependency, e.g.:
+                            // `procmacros = { package = "esp-hal-procmacros" }`
+                            //  ^^^^^^^^^^
+                            return Some(k.last().unwrap().get().to_string());
                         }
 
                         None
@@ -831,6 +886,7 @@ impl CargoToml {
     }
 }
 
+#[cfg_attr(not(feature = "release"), allow(dead_code))]
 fn format_dependency_version(previous: &str, new: &semver::Version) -> String {
     // we can expect the version specified in a TOML to be valid
     let previous = semver::VersionReq::parse(previous).unwrap();
@@ -924,6 +980,47 @@ mod tests {
                 "previous={previous}, new={new}"
             );
         }
+    }
+
+    #[test]
+    fn repo_dependency_requirements_excludes_dev_dependencies() {
+        // A dev-dependency (esp-radio -> esp-rtos in reality) must not be
+        // reported as a release dependency; normal and build dependencies are.
+        let manifest = r#"
+            [package]
+            name = "esp-radio"
+            version = "1.0.0"
+
+            [dependencies]
+            esp-hal = { version = "1.2.0", path = "../esp-hal" }
+
+            [build-dependencies]
+            esp-config = { version = "0.8.0", path = "../esp-config" }
+
+            [dev-dependencies]
+            esp-rtos = { version = "0.3.0", path = "../esp-rtos" }
+        "#;
+
+        let mut toml =
+            CargoToml::from_str(&std::path::PathBuf::new(), Package::EspRadio, manifest).unwrap();
+        let deps = toml
+            .repo_dependency_requirements()
+            .into_iter()
+            .map(|(pkg, _)| pkg)
+            .collect::<Vec<_>>();
+
+        assert!(
+            deps.contains(&Package::EspHal),
+            "normal dep missing: {deps:?}"
+        );
+        assert!(
+            deps.contains(&Package::EspConfig),
+            "build dep missing: {deps:?}"
+        );
+        assert!(
+            !deps.contains(&Package::EspRtos),
+            "dev dep should be excluded: {deps:?}"
+        );
     }
 
     #[test]

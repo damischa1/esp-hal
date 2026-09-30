@@ -4,23 +4,28 @@
 //! address.
 
 use crate::{
-    gpio::{LpPin, lp_io::LpFunction},
+    gpio::{
+        LpPin,
+        lp_io::{LpFunction, low_level},
+    },
     i2c::lp_i2c::{Error, LpI2c, Scl, Sda},
     peripherals::{GPIO, RTC_IO, SENS},
     time::Duration,
 };
 
 fn bind_pin(pin: &impl LpPin, function: LpFunction) {
+    let lp = pin.lp_number();
+
     GPIO::regs()
         .pin(pin.number() as usize)
         .modify(|_, w| w.pad_driver().bit(true));
     RTC_IO::regs()
-        .touch_pad(pin.number() as usize)
+        .touch_pad(lp as usize)
         .modify(|_, w| w.rue().bit(true).rde().bit(false));
     RTC_IO::regs()
         .rtc_gpio_enable_w1ts()
-        .write(|w| unsafe { w.rtc_gpio_enable_w1ts().bits(1 << pin.number()) });
-    pin.lp_set_config(true, true, function);
+        .write(|w| unsafe { w.rtc_gpio_enable_w1ts().bits(1 << lp) });
+    low_level::set_config(lp, true, true, function);
 }
 
 for_each_lp_function! {
@@ -62,6 +67,8 @@ impl<'d> LpI2c<'d> {
             .register_block()
             .ctrl()
             .modify(|_, w| w.i2c_reset().set_bit());
+        // The state machine does not always come out of reset when the pulse is shorter than this.
+        crate::rom::ets_delay_us(20);
         self.i2c
             .register_block()
             .ctrl()
@@ -93,6 +100,13 @@ impl<'d> LpI2c<'d> {
     }
 
     pub(super) fn configure(&mut self, config: &Config) -> Result<(), ConfigError> {
+        let ticks = nanos_to_clock(config.timeout.as_micros().saturating_mul(1_000));
+
+        // The register field is 20 bits wide.
+        if ticks > (1 << 20) - 1 {
+            return Err(ConfigError::TimeoutTooLong);
+        }
+
         self.i2c
             .register_block()
             .scl_low()
@@ -114,8 +128,6 @@ impl<'d> LpI2c<'d> {
             .scl_stop_period()
             .write(|w| unsafe { w.scl_stop_period().bits(config.timing.scl_stop_period) });
 
-        let ticks = nanos_to_clock(config.timeout.as_micros().saturating_mul(1_000));
-        let ticks = ticks.max(2u32.pow(19) - 1);
         self.i2c
             .register_block()
             .to()
@@ -171,23 +183,20 @@ impl<'d> LpI2c<'d> {
 
         for &byte in data.iter().skip(1) {
             match self.wait_for_tx_interrupt() {
-                Ok(is_tx) => {
-                    if is_tx {
-                        sens.sar_i2c_ctrl().modify(|r, w| {
-                            let mut value = r.sar_i2c_ctrl().bits();
-                            value &= !(0xFF << 19);
-                            value |= (byte as u32) << 19;
-                            value |= 1 << 27;
-                            unsafe { w.sar_i2c_ctrl().bits(value) }
-                        });
-                        self.i2c
-                            .register_block()
-                            .int_clr()
-                            .write(|w| w.tx_data().clear_bit_by_one());
-                    } else {
-                        core::panic!("Peripheral didn't wait for data");
-                    }
+                Ok(true) => {
+                    sens.sar_i2c_ctrl().modify(|r, w| {
+                        let mut value = r.sar_i2c_ctrl().bits();
+                        value &= !(0xFF << 19);
+                        value |= (byte as u32) << 19;
+                        value |= 1 << 27;
+                        unsafe { w.sar_i2c_ctrl().bits(value) }
+                    });
+                    self.i2c
+                        .register_block()
+                        .int_clr()
+                        .write(|w| w.tx_data().clear_bit_by_one());
                 }
+                Ok(false) => panic!("Peripheral didn't wait for data"),
                 Err(err) => {
                     // Stop transmission.
                     sens.sar_i2c_ctrl().modify(|_, w| {
@@ -288,17 +297,14 @@ impl<'d> LpI2c<'d> {
 
         for byte in data {
             match self.wait_for_rx_interrupt() {
-                Ok(is_rx) => {
-                    if is_rx {
-                        *byte = self.i2c.register_block().data().read().i2c_rdata().bits();
-                        self.i2c
-                            .register_block()
-                            .int_clr()
-                            .write(|w| w.rx_data().clear_bit_by_one());
-                    } else {
-                        core::panic!("Peripheral didn't wait for data to be read");
-                    }
+                Ok(true) => {
+                    *byte = self.i2c.register_block().data().read().i2c_rdata().bits();
+                    self.i2c
+                        .register_block()
+                        .int_clr()
+                        .write(|w| w.rx_data().clear_bit_by_one());
                 }
+                Ok(false) => panic!("Peripheral didn't wait for data to be read"),
                 Err(err) => {
                     // Stop transmission.
                     sens.sar_i2c_ctrl().modify(|_, w| {
@@ -406,7 +412,10 @@ impl<'d> LpI2c<'d> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
-pub enum ConfigError {}
+pub enum ConfigError {
+    /// The timeout period is longer than the configuration register allows.
+    TimeoutTooLong,
+}
 
 /// I2C driver configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, procmacros::BuilderLite)]
@@ -470,7 +479,7 @@ fn nanos_to_clock(nanos: u64) -> u32 {
     ((nanos as u128 * crate::soc::clocks::rc_fast_clk_frequency() as u128) / 1_000_000_000) as u32
 }
 
-/// A generic I2C Command
+/// A generic I2C Command.
 enum Command {
     Start,
     Stop,

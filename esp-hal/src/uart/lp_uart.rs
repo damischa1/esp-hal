@@ -1,7 +1,12 @@
 //! Low-power UART
 
 use crate::{
-    gpio::{InputPin, LpPin, OutputPin, lp_io::LpFunction},
+    gpio::{
+        InputPin,
+        LpPin,
+        OutputPin,
+        lp_io::{LpFunction, low_level},
+    },
     peripherals::{LP_CLKRST, LP_UART, LPWR},
     uart::{DataBits, Parity, StopBits},
 };
@@ -50,14 +55,14 @@ for_each_lp_function! {
             fn connect_tx(&self) {
                 // The output enable is left to the peripheral: selecting a function other than
                 // LP GPIO takes the pad's direction out of the LP GPIO peripheral's hands.
-                self.lp_set_config(false, true, LpFunction::$af);
+                low_level::set_config(self.lp_number(), false, true, LpFunction::$af);
             }
         }
     };
     (LP_UART_RXD, $gpio:ident, $af:ident) => {
         impl Rx for crate::peripherals::$gpio<'_> {
             fn connect_rx(&self) {
-                self.lp_set_config(true, true, LpFunction::$af);
+                low_level::set_config(self.lp_number(), true, true, LpFunction::$af);
             }
         }
     };
@@ -114,7 +119,7 @@ pub struct LpUart {
 }
 
 impl LpUart {
-    /// Initialize the UART driver using the provided configuration
+    /// Initializes the UART driver using the provided configuration.
     // TODO: CTS and RTS pins
     pub fn new(
         uart: LP_UART<'static>,
@@ -238,7 +243,7 @@ impl LpUart {
         self.update();
     }
 
-    /// Modify UART baud rate and reset TX/RX fifo.
+    /// Modifies UART baud rate and reset TX/RX fifo.
     pub fn change_baud(&mut self, config: &Config) {
         self.change_baud_internal(config);
         self.txfifo_reset();

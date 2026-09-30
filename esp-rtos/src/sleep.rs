@@ -6,9 +6,9 @@ use esp_hal::{
     peripherals::LPWR,
     rtc_cntl::{
         WakeLock,
-        sleep::{GpioWakeupSource, LowPower, TimerWakeupSource, WakeSource},
+        sleep::{LightSleep, LowPower, RtcSleepConfig},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{SCHEDULER, task::IdleFn};
@@ -36,10 +36,17 @@ pub struct DeepSleep {
 
 #[cfg(sleep_deep_sleep)]
 impl DeepSleep {
-    /// Puts the system into deep sleep, waking up from the specified wake sources.
-    pub fn deep_sleep(&mut self, wake_sources: &[&dyn WakeSource]) -> ! {
+    /// Puts the system into deep sleep.
+    ///
+    /// The sleep ends when one of the wakeup sources that the drivers enabled becomes active. The
+    /// wake from deep sleep resets the chip, so this function does not return.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no wakeup source is enabled, because nothing could end the sleep.
+    pub fn deep_sleep(&mut self) -> ! {
         let mut lpwr = LowPower::new(self.lpwr.reborrow());
-        lpwr.sleep_deep(wake_sources)
+        lpwr.sleep_deep(RtcSleepConfig::deep())
     }
 }
 
@@ -56,8 +63,11 @@ impl DeepSleep {
 /// - all cores are idle,
 /// - the next wakeup is at least `ESP_RTOS_CONFIG_LIGHT_SLEEP_MIN_US` microseconds away.
 ///
-/// If all hold, it calls [`LowPower::sleep_light`] for the next wakeup; otherwise
-/// it falls back to `WFI`. The minimum-residency threshold is configurable via the
+/// If all hold, it calls [`LowPower::sleep_light`] for the next wakeup. A wakeup source can
+/// refuse that sleep. The hook then falls back to `WFI`, as it does when a check above fails.
+/// A wakeup source can also bound the sleep. The driver clamps the wake timer inside the sleep
+/// call, after this hook has armed the next scheduler wakeup. The sooner of the two wins.
+/// The minimum-residency threshold is configurable via the
 /// `ESP_RTOS_CONFIG_LIGHT_SLEEP_MIN_US` build-time option (default `1000`).
 ///
 /// On multi-core chips, the core that commits to sleep hardware-stalls the other core(s)
@@ -124,16 +134,22 @@ extern "C" fn auto_light_sleep_hook() -> ! {
             };
             let next_wakeup = time_driver.next_wakeup();
 
-            let sleep_duration = if next_wakeup != u64::MAX {
-                let now = crate::now();
-                let sleep_duration = next_wakeup.saturating_sub(now);
-                if sleep_duration < LIGHT_SLEEP_MIN_US {
+            let mut lpwr = LowPower::new(unsafe { LPWR::steal() });
+
+            // The deadline stays until other code clears it, so each pass writes it, also a pass
+            // that makes no sleep. A deadline from an earlier pass expires, and the
+            // next sleep then returns immediately. A wakeup source can shorten this deadline
+            // inside `sleep_light`, or arm the timer when this hook cleared it. This call stays
+            // the scheduler's request. `sleep_light` restores it.
+            if next_wakeup == u64::MAX {
+                lpwr.clear_wakeup_deadline();
+            } else {
+                lpwr.set_wakeup_deadline(Instant::EPOCH + Duration::from_micros(next_wakeup));
+
+                if next_wakeup.saturating_sub(crate::now()) < LIGHT_SLEEP_MIN_US {
                     return;
                 }
-                Some(Duration::from_micros(sleep_duration))
-            } else {
-                None
-            };
+            }
 
             // We have committed to sleeping. Park (hardware-stall) the other core(s) so their
             // CPU state is frozen and restored coherently across the sleep, then enter light
@@ -153,28 +169,18 @@ extern "C" fn auto_light_sleep_hook() -> ! {
                 _ => {}
             }
 
-            unsafe {
-                let mut lpwr = LowPower::new(LPWR::steal());
+            // Each driver enables the wakeup source it owns. This hook does not know which
+            // sources are enabled. `sleep_light` returns immediately when none are enabled.
+            // It also returns immediately when a source refuses the sleep. Do not call it
+            // again here. The refusal is still true, and a retry would spin. `WFI` below
+            // waits for an interrupt.
+            let result = lpwr.sleep_light(RtcSleepConfig::default());
 
-                // Set up wake sources. We could use heapless here, but this
-                // code should be replaced by something more flexible anyway.
-                let gpio = GpioWakeupSource::new();
-                let timer;
-
-                let mut wakeup_sources: [&dyn WakeSource; 2] = [&gpio, &gpio];
-
-                if let Some(duration) = sleep_duration {
-                    timer = TimerWakeupSource::new(duration);
-                    wakeup_sources[0] = &timer;
-                }
-
-                lpwr.sleep_light(&wakeup_sources);
+            // The alarm timer is gated only while the chip is in light sleep. A refusal leaves
+            // the timer running, so its alarm is still valid.
+            if result == LightSleep::Ended {
+                time_driver.rearm(crate::now());
             }
-
-            // The alarm timer was gated during light sleep, so its pre-armed alarm is
-            // stale. Force a re-arm against the restored time base so the tick handler
-            // fires promptly and drains the timer queue.
-            time_driver.rearm(crate::now());
 
             // Trigger the scheduler on the other core to prevent it from putting
             // the system back to sleep immediately.

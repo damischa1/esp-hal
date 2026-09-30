@@ -104,6 +104,42 @@ macro_rules! common_test_pins {
     }};
 }
 
+// A pair of connected LP pads.
+#[macro_export]
+macro_rules! lp_test_pins {
+    ($peripherals:expr) => {{
+        cfg_select! {
+            esp32c5 => ($peripherals.GPIO4, $peripherals.GPIO5),
+            esp32h2 => ($peripherals.GPIO10, $peripherals.GPIO11),
+            // The pair of every other board is the one of `common_test_pins!`.
+            _ => $crate::common_test_pins!($peripherals),
+        }
+    }};
+}
+
+// A pair of connected HP pads.
+//
+// On the C2 the second pin is an LP pad, because the board has no second free HP pad. It only
+// observes the first one, so the pad under test is still HP.
+//
+// The ESP32 is missing, the devkit we use has no free HP pad at all.
+#[macro_export]
+macro_rules! hp_test_pins {
+    ($peripherals:expr) => {{
+        cfg_select! {
+            esp32c2 => ($peripherals.GPIO10, $peripherals.GPIO0),
+            esp32c3 => ($peripherals.GPIO6, $peripherals.GPIO7),
+            any(esp32c6, esp32c61) => ($peripherals.GPIO22, $peripherals.GPIO23),
+            esp32p4 => ($peripherals.GPIO46, $peripherals.GPIO53),
+            esp32s2 => ($peripherals.GPIO37, $peripherals.GPIO38),
+            esp32s3 => ($peripherals.GPIO40, $peripherals.GPIO41),
+            esp32s31 => ($peripherals.GPIO8, $peripherals.GPIO44),
+            // The HP pair of the C5 and of the H2 is the one of `common_test_pins!`.
+            any(esp32c5, esp32h2) => $crate::common_test_pins!($peripherals),
+        }
+    }};
+}
+
 // A GPIO that's not connected to anything. We use the BOOT pin for this, but
 // beware: it has a pullup.
 #[macro_export]
@@ -169,3 +205,84 @@ mod executor {
 pub use esp_rtos::embassy::Executor;
 #[cfg(not(feature = "embassy"))]
 pub use executor::Executor;
+
+/// Disables every watchdog timer with raw register writes.
+///
+/// This prevents the firmware reset loop if no debugger is attached. The function must not depend
+/// on esp-hal drivers, because a driver that is broken or half-initialized must not stop the tests
+/// from running.
+#[embedded_test::setup]
+fn disable_watchdogs_before_semihosting() {
+    cfg_select! {
+        soc_has_lp_wdt => {
+            use esp_hal::peripherals::LP_WDT;
+        }
+        _ => {
+            use esp_hal::peripherals::LPWR as LP_WDT;
+        }
+    }
+
+    // RWDT
+    let lp_wdt = LP_WDT::regs();
+    cfg_select! {
+        esp32p4 => {
+            lp_wdt.wprotect().write(|w| unsafe { w.bits(0x50D8_3AA1) });
+            lp_wdt.config0().write(|w| unsafe { w.bits(0) });
+            lp_wdt.wprotect().write(|w| unsafe { w.bits(0) });
+        }
+        _ => {
+            lp_wdt
+                .wdtwprotect()
+                .write(|w| unsafe { w.bits(0x50D8_3AA1) });
+            lp_wdt.wdtconfig0().write(|w| unsafe { w.bits(0) });
+            lp_wdt.wdtwprotect().write(|w| unsafe { w.bits(0) });
+        }
+    }
+
+    // SWD
+    #[cfg(soc_has_swd_watchdog)]
+    {
+        const SWD_WKEY: u32 = cfg_select! {
+            any(esp32c2, esp32c3, esp32s2, esp32s3) => 0x8F1D_312A,
+            _ => 0x50D8_3AA1,
+        };
+
+        lp_wdt
+            .swd_wprotect()
+            .write(|w| unsafe { w.swd_wkey().bits(SWD_WKEY) });
+        cfg_select! {
+            esp32p4 => lp_wdt
+                .swd_config()
+                .write(|w| w.swd_auto_feed_en().set_bit()),
+            _ => lp_wdt.swd_conf().write(|w| w.swd_auto_feed_en().set_bit()),
+        };
+        lp_wdt
+            .swd_wprotect()
+            .write(|w| unsafe { w.swd_wkey().bits(0) });
+    }
+
+    // MWDT
+    #[cfg(timergroup_timg0)]
+    {
+        let timg0 = esp_hal::peripherals::TIMG0::regs();
+        timg0
+            .wdtwprotect()
+            .write(|w| unsafe { w.wdt_wkey().bits(0x50D8_3AA1) });
+        timg0.wdtconfig0().modify(|_, w| w.wdt_en().clear_bit());
+        timg0
+            .wdtwprotect()
+            .write(|w| unsafe { w.wdt_wkey().bits(0) });
+    }
+
+    #[cfg(timergroup_timg1)]
+    {
+        let timg1 = esp_hal::peripherals::TIMG1::regs();
+        timg1
+            .wdtwprotect()
+            .write(|w| unsafe { w.wdt_wkey().bits(0x50D8_3AA1) });
+        timg1.wdtconfig0().modify(|_, w| w.wdt_en().clear_bit());
+        timg1
+            .wdtwprotect()
+            .write(|w| unsafe { w.wdt_wkey().bits(0) });
+    }
+}

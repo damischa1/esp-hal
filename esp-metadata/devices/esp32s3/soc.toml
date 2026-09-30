@@ -17,6 +17,9 @@ trm    = "https://www.espressif.com/sites/default/files/documentation/esp32-s3_t
 page_size = 0x10000
 entry_num = 384
 
+[device.flash]
+support_status = "partial"
+
 [device.rom]
 has_crc_le  = true
 has_crc_be  = true
@@ -44,13 +47,13 @@ peripherals = [
     { name = "EXTMEM" },
     { name = "MMU_TABLE", hidden = true },
     { name = "GPIO" },
-    { name = "GPIO_SD" },
+    { name = "GPIO_SD", clock_group = "SDM" },
     { name = "HMAC" },
     { name = "I2C_ANA_MST" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
     { name = "I2C1", interrupts = { peri = "I2C_EXT1" }, stable = true, clock_group = "I2C" },
-    { name = "I2S0", interrupts = { peri = "I2S0" } },
-    { name = "I2S1", interrupts = { peri = "I2S1" } },
+    { name = "I2S0", interrupts = { peri = "I2S0" }, clock_group = "I2S" },
+    { name = "I2S1", interrupts = { peri = "I2S1" }, clock_group = "I2S" },
     { name = "INTERRUPT_CORE0" },
     { name = "INTERRUPT_CORE1" },
     { name = "IO_MUX" },
@@ -60,7 +63,7 @@ peripherals = [
     { name = "RTC_TIMER", pac = "RTC_CNTL" },
     { name = "MCPWM0", clock_group = "MCPWM" },
     { name = "MCPWM1", clock_group = "MCPWM" },
-    { name = "PCNT" },
+    { name = "PCNT", interrupts = { peri = "PCNT" } },
     { name = "PERI_BACKUP" },
     { name = "RMT", clock_group = "RMT" },
     { name = "RNG" },
@@ -98,9 +101,13 @@ peripherals = [
     { name = "FLASH", virtual = true },
     { name = "GPIO_DEDICATED", virtual = true },
     { name = "PSRAM", virtual = true },
-    { name = "SW_INTERRUPT", virtual = true },
     { name = "ULP_RISCV_CORE", virtual = true },
     { name = "WIFI", virtual = true, interrupts = { mac = "WIFI_MAC", pwr = "WIFI_PWR" }, stable = true },
+    { name = "IPC", virtual = true },
+    { name = "FROM_CPU_INTR0", virtual = true, hidden = true },
+    { name = "FROM_CPU_INTR1", virtual = true, hidden = true },
+    { name = "FROM_CPU_INTR2", virtual = true },
+    { name = "FROM_CPU_INTR3", virtual = true },
 ]
 
 [device.soc.clocks]
@@ -207,6 +214,7 @@ support_status = "partial"
 status_registers = 4
 software_interrupt_count = 4
 controller = "Xtensa"
+context_switch_source = "software0"
 
 [device.rmt]
 support_status = "partial"
@@ -241,7 +249,8 @@ algo = {
 }
 
 [device.sdm]
-support_status = { status = "not_supported", issue = 2370 }
+support_status = "partial"
+channel_count = 8
 
 [device.spi_master]
 version = 3
@@ -324,6 +333,9 @@ apb_cycle_wait_num = 16 # TODO
 support_status = "partial"
 light_sleep = true
 deep_sleep = true
+ext1_version = 1
+pin_wakeup_version = 1
+deep_sleep_needs_gpio_isolation = true
 wakeup_sources = {
     # A UART wake cannot reject a sleep.
     rejectable = [
@@ -361,8 +373,7 @@ wakeup_sources = {
 ## Interfaces
 [device.i2s]
 version = 2
-default_clock_source = 2
-mclk_divider_bit_width = 6
+mclk_divider_bit_width = 9
 max_ws_width = 128
 instances = [
     {
@@ -397,11 +408,25 @@ instances = [
 
 [device.camera]
 [device.rgb_display]
+output_lines = 16
+
 [device.ledc]
 version = 2
 channel_count = 8
 [device.mcpwm]
 [device.pcnt]
+instances = {
+    PCNT = {
+        sys_instance = "Pcnt",
+        interrupt = "PCNT",
+        units = [
+            { sig_ch0 = "PCNT0_SIG_CH0", sig_ch1 = "PCNT0_SIG_CH1", ctrl_ch0 = "PCNT0_CTRL_CH0", ctrl_ch1 = "PCNT0_CTRL_CH1" },
+            { sig_ch0 = "PCNT1_SIG_CH0", sig_ch1 = "PCNT1_SIG_CH1", ctrl_ch0 = "PCNT1_CTRL_CH0", ctrl_ch1 = "PCNT1_CTRL_CH1" },
+            { sig_ch0 = "PCNT2_SIG_CH0", sig_ch1 = "PCNT2_SIG_CH1", ctrl_ch0 = "PCNT2_CTRL_CH0", ctrl_ch1 = "PCNT2_CTRL_CH1" },
+            { sig_ch0 = "PCNT3_SIG_CH0", sig_ch1 = "PCNT3_SIG_CH1", ctrl_ch0 = "PCNT3_CTRL_CH0", ctrl_ch1 = "PCNT3_CTRL_CH1" },
+        ],
+    },
+}
 
 [device.sdmmc]
 support_status = "partial"
@@ -455,7 +480,7 @@ octal_spi = true
 [device.systimer]
 [device.temp_sensor]
 [device.ulp_fsm]
-support_status = "not_supported"
+support_status = { status = "not_supported", issue = 376 }
 [device.ulp_riscv]
 [device.lp_timer]
 

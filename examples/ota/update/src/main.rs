@@ -9,14 +9,14 @@
 //! chip used!
 //!
 //! ```ignore,bash
-//! cargo xtask build examples gpio --chip=esp32
+//! cargo xtask build gpio esp32
 //! espflash save-image --chip=esp32 target/xtensa-esp32-none-elf/release/gpio_interrupt target/ota_image
-//! cargo xtask build examples update --chip=esp32
+//! cargo xtask build ota/update esp32
 //! espflash save-image --chip=esp32 target/xtensa-esp32-none-elf/release/ota_update target/ota_image
-//! cargo xtask build examples update --chip=esp32
+//! cargo xtask build ota/update esp32
 //! espflash save-image --chip=esp32 target/xtensa-esp32-none-elf/release/ota_update target/ota_image
 //! espflash erase-flash
-//! cargo xtask run example update --chip=esp32
+//! cargo xtask run ota/update esp32
 //! ```
 //!
 //! On first boot notice the firmware partition gets booted ("Loaded app from
@@ -98,6 +98,7 @@ fn main() -> ! {
             any(feature = "esp32", feature = "esp32s2", feature = "esp32s3") => peripherals.GPIO0,
             feature = "esp32c5" => peripherals.GPIO28,
             feature = "esp32p4" => peripherals.GPIO35,
+            feature = "esp32h4" => peripherals.GPIO34,
             feature = "esp32s31" => peripherals.GPIO61,
             _ => peripherals.GPIO9,
         };

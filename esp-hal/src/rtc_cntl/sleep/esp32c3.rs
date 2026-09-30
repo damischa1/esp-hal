@@ -1,4 +1,4 @@
-use super::WakeTriggers;
+use super::SleepKind;
 use crate::{
     peripherals::{APB_CTRL, BB, EXTMEM, FE, FE2, LPWR, NRX, SPI0, SPI1, SYSTEM},
     rtc_cntl::Rtc,
@@ -60,9 +60,9 @@ pub const RTC_CNTL_PD_CUR_MONITOR_DEFAULT: bool = false;
 pub const RTC_CNTL_PLL_BUF_WAIT_DEFAULT: u8 = 20;
 /// Default number of cycles to wait for the XTL buffer to stabilize.
 pub const RTC_CNTL_XTL_BUF_WAIT_DEFAULT: u8 = 100;
-/// Default number of cycles to wait for the internal 8MHz clock to stabilize.
+/// Default number of cycles to wait for the internal 8 MHz clock to stabilize.
 pub const RTC_CNTL_CK8M_WAIT_DEFAULT: u8 = 20;
-/// Default number of cycles required to enable the internal 8MHz clock.
+/// Default number of cycles required to enable the internal 8 MHz clock.
 pub const RTC_CK8M_ENABLE_WAIT_DEFAULT: u8 = 5;
 
 /// Minimum number of cycles for sleep duration.
@@ -70,7 +70,7 @@ pub const RTC_CNTL_MIN_SLP_VAL_MIN: u8 = 2;
 
 /// Power-up cycles for other hardware blocks.
 pub const OTHER_BLOCKS_POWERUP: u8 = 1;
-/// Wait cycles for other hardware blocks to stabilize.
+/// Waits cycles for other hardware blocks to stabilize.
 pub const OTHER_BLOCKS_WAIT: u16 = 1;
 
 /// Disables GPIO interrupt.
@@ -98,19 +98,19 @@ bitfield::bitfield! {
     pub u8, xtal_wait, set_xtal_wait: 15, 8;
     /// Number of rtc_fast_clk cycles to wait for PLL clock to be ready
     pub u8, pll_wait, set_pll_wait: 23, 16;
-    /// Perform clock control related initialization.
+    /// Performs clock control related initialization.
     pub clkctl_init, set_clkctl_init: 24;
-    /// Perform power control related initialization.
+    /// Performs power control related initialization.
     pub pwrctl_init, set_pwrctl_init: 25;
-    /// Force power down `RTC_DBOOST`.
+    /// Forces power-down of `RTC_DBOOST`.
     pub rtc_dboost_fpd, set_rtc_dboost_fpd: 26;
-    /// Keep the XTAL oscillator powered up in sleep.
+    /// Keeps the XTAL oscillator powered up in sleep.
     pub xtal_fpu, set_xtal_fpu: 27;
-    /// Keep the BBPLL oscillator powered up in sleep.
+    /// Keeps the BBPLL oscillator powered up in sleep.
     pub bbpll_fpu, set_bbpll_fpu: 28;
-    /// Enable clock gating when the CPU is in wait-for-interrupt state.
+    /// Enables clock gating when the CPU is in wait-for-interrupt state.
     pub cpu_waiti_clk_gate, set_cpu_waiti_clk_gate: 29;
-    /// Calibrate Ocode to make bandgap voltage more precise.
+    /// Calibrates Ocode to make bandgap voltage more precise.
     pub cali_ocode, set_cali_ocode: 30;
 }
 
@@ -193,7 +193,7 @@ bitfield::bitfield! {
     pub bt_pd_en, set_bt_pd_en: 6;
     /// power down CPU, but not restart when lightsleep.
     pub cpu_pd_en, set_cpu_pd_en: 7;
-    /// Power down Internal 8M oscillator
+    /// Powers down Internal 8M oscillator.
     pub int_8m_pd_en, set_int_8m_pd_en: 8;
     /// power down digital peripherals
     pub dig_peri_pd_en, set_dig_peri_pd_en: 9;
@@ -278,8 +278,8 @@ fn rtc_sleep_pu(val: bool) {
 
     APB_CTRL::regs().mem_power_up().modify(|_r, w| unsafe {
         w.sram_power_up()
-            .bits(if val { SYSCON_SRAM_POWER_UP } else { 0 })
-            .rom_power_up()
+            .bits(if val { SYSCON_SRAM_POWER_UP } else { 0 });
+        w.rom_power_up()
             .bits(if val { SYSCON_ROM_POWER_UP } else { 0 })
     });
 }
@@ -327,6 +327,10 @@ impl RtcSleepConfig {
         self.deep_slp()
     }
 
+    pub(crate) fn set_sleep_kind(&mut self, kind: SleepKind) {
+        self.set_deep_slp(kind == SleepKind::Deep);
+    }
+
     pub(crate) fn base_settings(_rtc: &Rtc<'_>) {
         let cfg = RtcConfig::default();
 
@@ -360,36 +364,28 @@ impl RtcSleepConfig {
             let init_cfg = RtcInitConfig::default();
 
             rtc_cntl.timer3().modify(|_, w| {
-                w
-                    // set wifi timer
-                    .wifi_powerup_timer()
-                    .bits(init_cfg.wifi_powerup_cycles())
-                    .wifi_wait_timer()
-                    .bits(init_cfg.wifi_wait_cycles())
-                    // set bt timer
-                    .bt_powerup_timer()
-                    .bits(init_cfg.bt_powerup_cycles())
-                    .bt_wait_timer()
-                    .bits(init_cfg.bt_wait_cycles())
+                // set wifi timer
+                w.wifi_powerup_timer().bits(init_cfg.wifi_powerup_cycles());
+                w.wifi_wait_timer().bits(init_cfg.wifi_wait_cycles());
+                // set bt timer
+                w.bt_powerup_timer().bits(init_cfg.bt_powerup_cycles());
+                w.bt_wait_timer().bits(init_cfg.bt_wait_cycles())
             });
 
             rtc_cntl.timer4().modify(|_, w| {
                 w.cpu_top_powerup_timer()
-                    .bits(init_cfg.cpu_top_powerup_cycles())
-                    .cpu_top_wait_timer()
-                    .bits(init_cfg.cpu_top_wait_cycles())
-                    // set digital wrap timer
-                    .dg_wrap_powerup_timer()
-                    .bits(init_cfg.dg_wrap_powerup_cycles())
-                    .dg_wrap_wait_timer()
-                    .bits(init_cfg.dg_wrap_wait_cycles())
+                    .bits(init_cfg.cpu_top_powerup_cycles());
+                w.cpu_top_wait_timer().bits(init_cfg.cpu_top_wait_cycles());
+                // set digital wrap timer
+                w.dg_wrap_powerup_timer()
+                    .bits(init_cfg.dg_wrap_powerup_cycles());
+                w.dg_wrap_wait_timer().bits(init_cfg.dg_wrap_wait_cycles())
             });
 
             rtc_cntl.timer6().modify(|_, w| {
                 w.dg_peri_powerup_timer()
-                    .bits(init_cfg.dg_peri_powerup_cycles())
-                    .dg_peri_wait_timer()
-                    .bits(init_cfg.dg_peri_wait_cycles())
+                    .bits(init_cfg.dg_peri_powerup_cycles());
+                w.dg_peri_wait_timer().bits(init_cfg.dg_peri_wait_cycles())
             });
 
             // TODO: something about cali_ocode
@@ -450,21 +446,15 @@ impl RtcSleepConfig {
                 // cancel bbpll force pu if setting no force power up
 
                 rtc_cntl.options0().modify(|_, w| {
-                    w.bbpll_force_pu()
-                        .bit(cfg.bbpll_fpu())
-                        .bbpll_i2c_force_pu()
-                        .bit(cfg.bbpll_fpu())
-                        .bb_i2c_force_pu()
-                        .bit(cfg.bbpll_fpu())
+                    w.bbpll_force_pu().bit(cfg.bbpll_fpu());
+                    w.bbpll_i2c_force_pu().bit(cfg.bbpll_fpu());
+                    w.bb_i2c_force_pu().bit(cfg.bbpll_fpu())
                 });
 
                 rtc_cntl.rtc_cntl().modify(|_, w| {
-                    w.regulator_force_pu()
-                        .clear_bit()
-                        .dboost_force_pu()
-                        .clear_bit()
-                        .dboost_force_pd()
-                        .bit(cfg.rtc_dboost_fpd())
+                    w.regulator_force_pu().clear_bit();
+                    w.dboost_force_pu().clear_bit();
+                    w.dboost_force_pd().bit(cfg.rtc_dboost_fpd())
                 });
 
                 // If this mask is enabled, all soc memories cannot enter power down mode
@@ -481,29 +471,19 @@ impl RtcSleepConfig {
                 rtc_sleep_pu(false);
 
                 rtc_cntl.dig_pwc().modify(|_, w| {
-                    w.dg_wrap_force_pu()
-                        .clear_bit()
-                        .wifi_force_pu()
-                        .clear_bit()
-                        .bt_force_pu()
-                        .clear_bit()
-                        .cpu_top_force_pu()
-                        .clear_bit()
-                        .dg_peri_force_pu()
-                        .clear_bit()
+                    w.dg_wrap_force_pu().clear_bit();
+                    w.wifi_force_pu().clear_bit();
+                    w.bt_force_pu().clear_bit();
+                    w.cpu_top_force_pu().clear_bit();
+                    w.dg_peri_force_pu().clear_bit()
                 });
 
                 rtc_cntl.dig_iso().modify(|_, w| {
-                    w.dg_wrap_force_noiso()
-                        .clear_bit()
-                        .wifi_force_noiso()
-                        .clear_bit()
-                        .bt_force_noiso()
-                        .clear_bit()
-                        .cpu_top_force_noiso()
-                        .clear_bit()
-                        .dg_peri_force_noiso()
-                        .clear_bit()
+                    w.dg_wrap_force_noiso().clear_bit();
+                    w.wifi_force_noiso().clear_bit();
+                    w.bt_force_noiso().clear_bit();
+                    w.cpu_top_force_noiso().clear_bit();
+                    w.dg_peri_force_noiso().clear_bit()
                 });
 
                 // if SYSTEM_CPU_WAIT_MODE_FORCE_ON == 0 , the cpu clk will be closed when cpu
@@ -516,10 +496,8 @@ impl RtcSleepConfig {
                 // cancel digital PADS force no iso
 
                 rtc_cntl.dig_iso().modify(|_, w| {
-                    w.dg_pad_force_unhold()
-                        .clear_bit()
-                        .dg_pad_force_noiso()
-                        .clear_bit()
+                    w.dg_pad_force_unhold().clear_bit();
+                    w.dg_pad_force_noiso().clear_bit()
                 });
             }
 
@@ -592,15 +570,26 @@ impl RtcSleepConfig {
                 w.pd_cur_monitor().bit(RTC_CNTL_PD_CUR_MONITOR_DEFAULT)
             });
 
-            assert!(!self.pd_cur_slp() || self.bias_sleep_slp());
+            // Like `rtc_sleep_get_default_config`: a crystal that stays on through a light sleep
+            // needs the bias current and the voltage of the active mode.
+            let xtal_on = self.xtal_fpu() && !self.deep_slp();
+            let bias_sleep_slp = self.bias_sleep_slp() && !xtal_on;
+            let pd_cur_slp = self.pd_cur_slp() && !xtal_on;
+            let dbg_atten_slp = if xtal_on {
+                RTC_CNTL_DBG_ATTEN_LIGHTSLEEP_NODROP
+            } else {
+                self.dbg_atten_slp()
+            };
+
+            assert!(!pd_cur_slp || bias_sleep_slp);
 
             regi2c::I2C_DIG_REG_EXT_RTC_DREG_SLEEP.write_field(self.rtc_dbias_slp());
             regi2c::I2C_DIG_REG_EXT_DIG_DREG_SLEEP.write_field(self.dig_dbias_slp());
 
             rtc_cntl.bias_conf().modify(|_, w| {
-                w.dbg_atten_deep_slp().bits(self.dbg_atten_slp());
-                w.bias_sleep_deep_slp().bit(self.bias_sleep_slp());
-                w.pd_cur_deep_slp().bit(self.pd_cur_slp())
+                w.dbg_atten_deep_slp().bits(dbg_atten_slp);
+                w.bias_sleep_deep_slp().bit(bias_sleep_slp);
+                w.pd_cur_deep_slp().bit(pd_cur_slp)
             });
 
             if self.deep_slp() {
@@ -668,12 +657,20 @@ impl RtcSleepConfig {
         }
     }
 
-    pub(crate) fn start_sleep(&self, wakeup_triggers: WakeTriggers) {
+    /// Configures the wakeup options and requests the sleep.
+    ///
+    /// The caller waits for the result of the request.
+    pub(crate) fn start_sleep(&self, wakeup_mask: u32, reject_mask: u32) {
         // set bits for what can wake us up
-        LPWR::regs().wakeup_state().modify(|_, w| unsafe {
-            w.wakeup_ena()
-                .bits((wakeup_triggers.as_u32() as u16).into())
-        });
+        LPWR::regs()
+            .wakeup_state()
+            .modify(|_, w| unsafe { w.wakeup_ena().bits(wakeup_mask) });
+
+        // Set the bits of the sources that reject the sleep. The reject enables that `apply` wrote
+        // arm those sources.
+        LPWR::regs()
+            .slp_reject_conf()
+            .modify(|_, w| unsafe { w.sleep_reject_ena().bits(reject_mask) });
 
         LPWR::regs().state0().modify(|_, w| w.sleep_en().set_bit());
     }

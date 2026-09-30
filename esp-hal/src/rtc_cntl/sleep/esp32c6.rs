@@ -6,9 +6,12 @@ use crate::{
     rtc_cntl::{
         Rtc,
         rtc::{HpAnalog, HpSysCntlReg, HpSysPower, LpAnalog, LpSysPower},
-        sleep::{Ext1WakeupSource, WakeTriggers, pmu_common::SleepTimeConfig},
+        sleep::{SleepKind, pmu_common::SleepTimeConfig},
     },
-    soc::clocks::{self, ClockTree, LpSlowClkConfig, SocRootClkConfig},
+    soc::{
+        clocks::{self, ClockTree, SocRootClkConfig},
+        xtal32k,
+    },
 };
 
 /// Configuration for controlling the behavior during sleep modes.
@@ -227,28 +230,14 @@ impl PowerSleepConfig {
         self.hp_sys.dig_power.set_aon_pd_en(pd_flags.pd_hp_aon());
         self.hp_sys.dig_power.set_top_pd_en(pd_flags.pd_top());
 
-        if pd_flags.pd_modem() {
-            // The modem (Wi-Fi/BLE) power domain is powered down during sleep, so
-            // isolate and retain its analog I2C buses as before.
-            self.hp_sys.clk.set_i2c_iso_en(true);
-            self.hp_sys.clk.set_i2c_retention(true);
-        } else {
-            // The modem power domain is kept on across (light-)sleep
-            // (`pd_modem == false`, the default). In that case its analog blocks -
-            // the BBPLL and the analog I2C buses used to (re)configure it - must be
-            // kept powered too, matching the `HP_MODEM` power state. Otherwise the
-            // radio comes back without a usable PLL and can no longer transmit
-            // (e.g. BLE advertising silently stops working) after wakeup.
-            self.hp_sys.clk.set_i2c_iso_en(false);
-            self.hp_sys.clk.set_i2c_retention(false);
-            self.hp_sys.clk.set_xpd_bb_i2c(true);
-            self.hp_sys.clk.set_xpd_bbpll_i2c(true);
-            self.hp_sys.clk.set_xpd_bbpll(true);
-        }
+        self.hp_sys.clk.set_i2c_iso_en(true);
+        self.hp_sys.clk.set_i2c_retention(true);
 
         self.hp_sys.xtal.set_xpd_xtal(pd_flags.pd_xtal().not());
 
-        self.lp_sys_active.clk_power.set_xpd_xtal32k(true);
+        self.lp_sys_active
+            .clk_power
+            .set_xpd_xtal32k(xtal32k::use_xtal32k());
         self.lp_sys_active.clk_power.set_xpd_rc32k(true);
         self.lp_sys_active.clk_power.set_xpd_fosc(true);
 
@@ -568,7 +557,7 @@ impl SleepTimeConfig {
 pub struct RtcSleepConfig {
     /// Deep Sleep flag
     pub deep: bool,
-    /// Power Down flags
+    /// Powers Down flags.
     pub pd_flags: PowerDownFlags,
 }
 
@@ -586,7 +575,7 @@ impl Default for RtcSleepConfig {
 
 bitfield::bitfield! {
     #[derive(Clone, Copy)]
-    /// Power domains to be powered down during sleep
+    /// Power domains to be powered down during sleep.
     pub struct PowerDownFlags(u32);
 
     /// Controls the power-down status of the top power domain.
@@ -613,16 +602,16 @@ bitfield::bitfield! {
     pub u32, pd_xtal     , set_pd_xtal     : 10;
     /// Controls the power-down status of the fast RC oscillator.
     pub u32, pd_rc_fast  , set_pd_rc_fast  : 11;
-    /// Controls the power-down status of the 32kHz crystal oscillator.
+    /// Controls the power-down status of the 32 kHz crystal oscillator.
     pub u32, pd_xtal32k  , set_pd_xtal32k  : 12;
-    /// Controls the power-down status of the 32kHz RC oscillator.
+    /// Controls the power-down status of the 32 kHz RC oscillator.
     pub u32, pd_rc32k    , set_pd_rc32k    : 13;
     /// Controls the power-down status of the low-power peripheral domain.
     pub u32, pd_lp_periph, set_pd_lp_periph: 14;
 }
 
 impl PowerDownFlags {
-    /// Checks whether all memory groups (G0, G1, G2, G3) are powered down.
+    /// Returns whether all memory groups (G0, G1, G2, G3) are powered down.
     pub fn pd_mem(self) -> bool {
         self.pd_mem_g0() && self.pd_mem_g1() && self.pd_mem_g2() && self.pd_mem_g3()
     }
@@ -690,23 +679,24 @@ impl RtcSleepConfig {
         self.deep
     }
 
-    pub(crate) fn base_settings(_rtc: &Rtc<'_>) {
-        Self::wake_io_reset();
-    }
+    pub(crate) fn base_settings(_rtc: &Rtc<'_>) {}
 
-    fn wake_io_reset() {
-        // loosely based on esp_deep_sleep_wakeup_io_reset
-        Ext1WakeupSource::wake_io_reset();
-    }
+    /// Selects the kind of the sleep, and what the sleep powers down.
+    ///
+    /// Sleep entry calls this before the hooks of the wakeup sources, so that a source can keep
+    /// powered what it needs.
+    pub(crate) fn set_sleep_kind(&mut self, kind: SleepKind) {
+        self.deep = kind == SleepKind::Deep;
 
-    /// Finalize power-down flags, apply configuration based on the flags.
-    pub(crate) fn apply(&mut self) {
-        let lp_slow_uses_xtal32k = ClockTree::with(|clocks| {
-            matches!(
-                clocks::lp_slow_clk_config(clocks),
-                Some(LpSlowClkConfig::Xtal32k)
-            )
-        });
+        let lp_slow_uses_xtal32k = cfg_select! {
+            use_xtal32k => ClockTree::with(|clocks| {
+                matches!(
+                    clocks::lp_slow_clk_config(clocks),
+                    Some(clocks::LpSlowClkConfig::Xtal32k)
+                )
+            }),
+            _ => false,
+        };
 
         if self.deep {
             // force-disable certain power domains
@@ -736,14 +726,12 @@ impl RtcSleepConfig {
         }
     }
 
-    /// Configures wakeup options and enters sleep.
+    /// Configures the wakeup options and requests the sleep.
     ///
-    /// This function does not return if deep sleep is requested.
-    pub(crate) fn start_sleep(&self, wakeup_triggers: WakeTriggers) {
-        let wakeup_mask = wakeup_triggers.as_u32();
-        let reject_mask = wakeup_triggers.reject_mask(self.deep);
-
-        let _restore_clock_config = ClockTree::with(|clocks| {
+    /// The caller waits for the result of the request. The return value is a guard that restores
+    /// what sleep entry changed for the sleep only, so the caller keeps it until the sleep ends.
+    pub(crate) fn start_sleep(&self, wakeup_mask: u32, reject_mask: u32) -> impl Sized {
+        let restore_clock_config = ClockTree::with(|clocks| {
             let old_root = clocks.soc_root_clk();
 
             clocks::configure_soc_root_clk(clocks, SocRootClkConfig::Xtal);
@@ -751,6 +739,7 @@ impl RtcSleepConfig {
             // Restore the old clock settings when we return
             DropGuard::new((), move |_| {
                 ClockTree::with(|clocks| {
+                    crate::soc::clocks::reconfigure_pll(clocks);
                     if let Some(old_root) = old_root {
                         clocks::configure_soc_root_clk(clocks, old_root);
                     }
@@ -800,7 +789,7 @@ impl RtcSleepConfig {
 
         // pmu_ll_hp_set_reject_enable
         PMU::regs().slp_wakeup_cntl1().modify(|_, w| unsafe {
-            w.slp_reject_en().bit(true);
+            w.slp_reject_en().bit(reject_mask != 0);
             w.sleep_reject_ena().bits(reject_mask)
         });
 
@@ -827,23 +816,15 @@ impl RtcSleepConfig {
             .slp_wakeup_cntl0()
             .write(|w| w.sleep_req().bit(true));
 
-        // In pd_cpu lightsleep and deepsleep mode, we never get here
-        loop {
-            let int_raw = PMU::regs().int_raw().read();
-            if int_raw.soc_wakeup().bit_is_set() || int_raw.soc_sleep_reject().bit_is_set() {
-                break;
-            }
-        }
+        restore_clock_config
     }
 
-    /// Cleans up after sleep
+    /// Cleans up after sleep.
     pub(crate) fn finish_sleep(&self) {
         // like esp-idf pmu_sleep_finish()
         // In "pd_cpu lightsleep" and "deepsleep" modes we never get here
 
-        // esp-idf returns if the sleep was rejected, we do nothing
-        // pmu_ll_hp_is_sleep_reject(PMU_instance()->hal->dev)
-
-        Self::wake_io_reset();
+        // The post-wake hook of the GPIO driver releases the pads that the sleep armed. Only that
+        // driver knows which pads it prepared.
     }
 }

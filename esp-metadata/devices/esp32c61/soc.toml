@@ -17,6 +17,9 @@ trm    = "https://www.espressif.com/sites/default/files/documentation/esp32-c61_
 page_size = 0x10000
 entry_num = 512
 
+[device.flash]
+support_status = "partial"
+
 [device.rom]
 has_crc_le  = true
 has_crc_be  = true
@@ -39,7 +42,7 @@ memory_map = { ranges = [
 ] }
 
 peripherals = [
-    # { name = "APB_SARADC" },
+    { name = "APB_SARADC" },
     # { name = "AVC" },
     { name = "ASSIST_DEBUG"},
     { name = "CLINT" },
@@ -57,7 +60,7 @@ peripherals = [
     { name = "HP_SYS" },
     { name = "I2C_ANA_MST" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
-    { name = "I2S0", interrupts = { peri = "I2S0" } },
+    { name = "I2S0", interrupts = { peri = "I2S0" }, clock_group = "I2S" },
     # { name = "IEEE802154" }, # TODO: add PAC manually later
     { name = "INTERRUPT_CORE0" },
     { name = "INTPRI" },
@@ -99,26 +102,33 @@ peripherals = [
     { name = "UART2", interrupts = { peri = "UART2" }, stable = true, clock_group = "UART" },
     { name = "USB_DEVICE", interrupts = { peri = "USB_DEVICE" } },
 
+    { name = "ADC1", virtual = true },
     { name = "BT", virtual = true, interrupts = { mac = "BT_MAC", lp_timer = "LP_TIMER" } },
     { name = "FLASH", virtual = true },
     { name = "GPIO_DEDICATED", virtual = true },
-    { name = "LP_CORE", virtual = true },
-    { name = "SW_INTERRUPT", virtual = true },
     { name = "WIFI", virtual = true, interrupts = { bb = "WIFI_BB", mac = "WIFI_MAC", pwr = "WIFI_PWR" }, stable = true  },
     { name = "PSRAM", virtual = true },
+    { name = "FROM_CPU_INTR0", virtual = true },
+    { name = "FROM_CPU_INTR1", virtual = true },
+    { name = "FROM_CPU_INTR2", virtual = true },
+    { name = "FROM_CPU_INTR3", virtual = true },
 ]
 
 [device.soc.clocks]
 # {include clocks.toml}
 
 [device.adc]
-support_status = { status = "not_supported", issue = 5422 }
+support_status = "partial"
+instances = [
+    { name = "adc1" },
+]
 
 [device.interrupts]
 support_status = "partial"
 status_registers = 3
 software_interrupt_count = 4
 controller = { Riscv = { flavour = "clic", interrupts = 32, priority_levels = 8 } }
+context_switch_source = "clint"
 
 [device.timergroup]
 support_status = "partial"
@@ -146,7 +156,7 @@ engines = [
         name = "AHB_GDMA",
         max_priority = 5,
         burst_sizes = [4, 16, 32],
-        drivers = ["sha", "spi_master", "i2s"],
+        drivers = ["sha", "spi_master", "spi_slave", "i2s"],
         peripheral_instances = [
             { name = "SPI2", dma_id = 1 },
             { name = "I2S0", dma_id = 3 },
@@ -200,6 +210,8 @@ support_status = { status = "not_supported", issue = 5419 }
 support_status = "partial"
 light_sleep = true
 deep_sleep = true
+ext1_version = 2
+pin_wakeup_version = 3
 wakeup_sources = {
     Ext1 = 1,
     Gpio = 2,
@@ -234,7 +246,7 @@ has_sclk_enable = true
 
 [device.i2c_master]
 support_status = "supported"
-version = 3
+version = 4
 instances = [
     { name = "i2c0", sys_instance = "I2cExt0", scl = "I2CEXT0_SCL", sda = "I2CEXT0_SDA" },
 ]
@@ -307,7 +319,6 @@ support_status = { status = "not_supported", issue = 5423 }
 
 [device.i2s]
 version = 3
-default_clock_source = 2
 mclk_divider_bit_width = 9
 max_ws_width = 512
 clock_configured_by_pcr = true

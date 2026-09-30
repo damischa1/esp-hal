@@ -14,11 +14,15 @@ use crate::efuse::ChipRevision;
 #[cfg_attr(esp32c6, path = "esp32c6/mod.rs")]
 #[cfg_attr(esp32c61, path = "esp32c61/mod.rs")]
 #[cfg_attr(esp32h2, path = "esp32h2/mod.rs")]
+#[cfg_attr(esp32h4, path = "esp32h4/mod.rs")]
 #[cfg_attr(esp32p4, path = "esp32p4/mod.rs")]
 #[cfg_attr(esp32s2, path = "esp32s2/mod.rs")]
 #[cfg_attr(esp32s3, path = "esp32s3/mod.rs")]
 #[cfg_attr(esp32s31, path = "esp32s31/mod.rs")]
 mod implementation;
+
+#[cfg(soc_has_xtal32k_pads)]
+pub(crate) mod xtal32k;
 
 cfg_select! {
     all(feature = "unstable", ulp_riscv_driver_supported) => {
@@ -53,15 +57,10 @@ pub(crate) fn is_slice_in_psram<T>(slice: &[T]) -> bool {
 
 #[allow(unused)]
 pub(crate) fn is_valid_memory_address(address: usize) -> bool {
-    if is_valid_ram_address(address) {
-        return true;
+    cfg_select! {
+        soc_has_psram => is_valid_ram_address(address) || is_valid_psram_address(address),
+        _ => is_valid_ram_address(address),
     }
-    #[cfg(soc_has_psram)]
-    if is_valid_psram_address(address) {
-        return true;
-    }
-
-    false
 }
 
 fn slice_in_range<T>(slice: &[T], range: Range<usize>) -> bool {
@@ -98,9 +97,8 @@ fn hal_main(a0: usize, a1: usize, a2: usize) -> ! {
 mod xtensa {
     use core::arch::{global_asm, naked_asm};
 
-    /// The ESP32 has a first stage bootloader that handles loading program data
-    /// into the right place therefore we skip loading it again. This function
-    /// is called by xtensa-lx-rt in Reset.
+    /// The ESP32 has a first stage bootloader that handles loading program data into the right
+    /// place, so loading is skipped here. Called by xtensa-lx-rt in Reset.
     #[unsafe(export_name = "__init_data")]
     extern "C" fn __init_data() -> bool {
         false
@@ -114,6 +112,8 @@ mod xtensa {
     }
 
     unsafe extern "C" {
+        static _dram2_uninit_bss_start: u32;
+        static _dram2_uninit_bss_end: u32;
         static _rtc_fast_bss_start: u32;
         static _rtc_fast_bss_end: u32;
         static _rtc_fast_persistent_end: u32;
@@ -134,6 +134,9 @@ mod xtensa {
         .literal sym_init_persistent, {__init_persistent}
         .literal sym_xtensa_lx_rt_zero_fill, {_xtensa_lx_rt_zero_fill}
 
+        .literal sym_dram2_uninit_bss_start, {_dram2_uninit_bss_start}
+        .literal sym_dram2_uninit_bss_end, {_dram2_uninit_bss_end}
+
         .literal sym_rtc_fast_bss_start, {_rtc_fast_bss_start}
         .literal sym_rtc_fast_bss_end, {_rtc_fast_bss_end}
         .literal sym_rtc_fast_persistent_end, {_rtc_fast_persistent_end}
@@ -146,6 +149,9 @@ mod xtensa {
         ",
         __init_persistent = sym __init_persistent,
         _xtensa_lx_rt_zero_fill = sym _xtensa_lx_rt_zero_fill,
+
+        _dram2_uninit_bss_end = sym _dram2_uninit_bss_end,
+        _dram2_uninit_bss_start = sym _dram2_uninit_bss_start,
 
         _rtc_fast_bss_end = sym _rtc_fast_bss_end,
         _rtc_fast_bss_start = sym _rtc_fast_bss_start,
@@ -167,6 +173,10 @@ mod xtensa {
             entry  a1, 0x10                            // 4 words for callx4 spill area
 
             l32r   a2, sym_xtensa_lx_rt_zero_fill      // Pre-load address of zero-fill function
+
+            l32r   a6, sym_dram2_uninit_bss_start      // Set input range to .dram2_uninit.bss
+            l32r   a7, sym_dram2_uninit_bss_end        //
+            callx4 a2                                  // Zero-fill
 
             l32r   a6, sym_rtc_fast_bss_start          // Set input range to .rtc_fast.bss
             l32r   a7, sym_rtc_fast_bss_end            //
@@ -357,6 +367,18 @@ pub(crate) fn enable_pmp() {
         end_addr: u32,
         permission: u8,
     ) -> Result<(), PmpError> {
+        let granularity = cfg_select! {
+            // this limits the effectiveness for these targets
+            // we could adjust the linker scripts to honor the granularity but that
+            // would waste some memory
+            //
+            // TODO: #6311 will be the proper metadata backed implementation
+            any(esp32c5, esp32c61, esp32p4, esp32s31) => 128,
+            _ => 4,
+        };
+        let start_addr = start_addr.next_multiple_of(granularity);
+        let end_addr = end_addr & !(granularity - 1);
+
         if start_addr >= end_addr {
             return Err(PmpError::InvalidRange);
         }
@@ -403,7 +425,7 @@ pub(crate) fn enable_pmp() {
         Ok(())
     }
 
-    /// Returns true if a PMP entry is unlocked and disabled (address matching OFF).
+    /// Returns whether a PMP entry is unlocked and disabled (address matching OFF).
     unsafe fn is_pmp_entry_free(idx: usize) -> bool {
         let cfg_reg = idx / 4;
         let byte_offset = idx % 4;
@@ -591,13 +613,13 @@ fn chip_revision_in_range(range: Range<ChipRevision>) -> bool {
     range.start <= chip_revision && chip_revision < range.end
 }
 
-/// Returns true if the chip revision is at least the given revision.
+/// Returns whether the chip revision is at least the given revision.
 #[allow(dead_code)]
 pub(crate) fn chip_revision_above(revision: ChipRevision) -> bool {
     chip_revision_in_range(revision..MAX_REVISION)
 }
 
-/// Returns true if the chip is at least the given revision, in the same major version.
+/// Returns whether the chip is at least the given revision, in the same major version.
 #[allow(dead_code)]
 pub(crate) fn chip_minor_revision_above(revision: ChipRevision) -> bool {
     let next_major = ChipRevision {

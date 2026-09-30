@@ -41,6 +41,17 @@ pub(crate) fn enable_branch_predictor() {
     }
 }
 
+#[cfg(feature = "unstable")]
+pub(crate) fn disable_branch_predictor() {
+    // Clears the bits set by `enable_branch_predictor`.
+    const MHCR_RS: u32 = 1 << 4;
+    const MHCR_BFE: u32 = 1 << 5;
+    const MHCR_BTB: u32 = 1 << 12;
+    unsafe {
+        core::arch::asm!("csrrc x0, 0x7c1, {0}", in(reg) MHCR_RS | MHCR_BFE | MHCR_BTB);
+    }
+}
+
 const CACHE_MAP_L1_ICACHE_0: u32 = 1 << 0;
 const CACHE_MAP_L1_ICACHE_1: u32 = 1 << 1;
 const CACHE_MAP_L1_DCACHE: u32 = 1 << 4;
@@ -52,7 +63,7 @@ fn cache_l2_bus(addr: u32) -> u32 {
     if internal { 0 } else { CACHE_MAP_L2_CACHE }
 }
 
-/// Write back a specific range of data in the cache.
+/// Writes back a specific range of data in the cache.
 pub(crate) unsafe fn cache_writeback_addr(addr: u32, size: u32) {
     unsafe extern "C" {
         fn Cache_WriteBack_Addr(bus: u32, addr: u32, size: u32);
@@ -86,10 +97,4 @@ pub(crate) unsafe fn cache_invalidate_icache_addr(addr: u32, size: u32) {
             size,
         );
     }
-}
-
-#[cfg(i2s_driver_supported)]
-#[cfg_attr(not(feature = "unstable"), allow(unused))]
-pub(crate) fn i2s_sclk_frequency() -> u32 {
-    clocks::pll_f160m_frequency()
 }

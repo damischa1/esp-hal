@@ -1,4 +1,5 @@
 //! BLE controller
+use alloc::boxed::Box;
 use core::{future::Future, task::Poll};
 
 use bt_hci::{
@@ -10,12 +11,23 @@ use bt_hci::{
 };
 use bt_hci_transport::{PacketKind, PacketToController, PacketToHost};
 use docsplay::Display;
+use embassy_sync::mutex::Mutex;
 use esp_phy::PhyInitGuard;
+use esp_sync::RawMutex;
 
 use crate::{
     RadioRefGuard,
     asynch::AtomicWaker,
-    ble::{Config, InvalidConfigError, have_hci_read_data, read_hci, read_next, send_hci},
+    ble::{
+        Config,
+        HciOutCollector,
+        InvalidConfigError,
+        have_hci_packet,
+        have_hci_read_data,
+        read_hci,
+        read_next,
+        take_next,
+    },
 };
 
 #[derive(Display, Debug, Copy, Clone, Eq, PartialEq, Hash)]
@@ -41,11 +53,15 @@ pub struct BleConnector<'d> {
     _phy_init_guard: PhyInitGuard<'d>,
     _device: crate::hal::peripherals::BT<'d>,
     _guard: RadioRefGuard,
+    /// The `Transport` implementations write through a shared reference, so they need the mutex to
+    /// get at the writer.
+    hci_writer: Mutex<RawMutex, HciOutCollector>,
 }
 
 impl Drop for BleConnector<'_> {
     fn drop(&mut self) {
         crate::ble::ble_deinit();
+        crate::ble::clear_bt_state();
     }
 }
 impl<'d> BleConnector<'d> {
@@ -55,7 +71,13 @@ impl<'d> BleConnector<'d> {
         device: crate::hal::peripherals::BT<'d>,
         config: Config,
     ) -> Result<BleConnector<'d>, BleInitError> {
-        let _guard = RadioRefGuard::new();
+        // With modem sleep, the claimed `Bt` wakeup source refuses the sleeps that are not safe.
+        // The driver claims it only where light sleep works with the controller.
+        let _guard = if config.modem_sleep() && crate::ble::lp_clk::light_sleep_supported() {
+            RadioRefGuard::without_wake_lock()
+        } else {
+            RadioRefGuard::new()
+        };
 
         config.validate()?;
 
@@ -63,6 +85,7 @@ impl<'d> BleConnector<'d> {
             _phy_init_guard: crate::ble::ble_init(&config),
             _device: device,
             _guard,
+            hci_writer: Mutex::new(HciOutCollector::new()),
         })
     }
 
@@ -95,20 +118,25 @@ impl<'d> BleConnector<'d> {
             return Ok(0);
         }
 
-        if !have_hci_read_data() {
-            HciReadyEventFuture.await;
-        }
+        HciAnyDataReadyEventFuture.await;
 
         self.read(buf)
     }
 
     /// Write to HCI.
+    ///
+    /// Returns the number of bytes written, which is at most one packet.
     #[instability::unstable]
     pub fn write(&mut self, buf: &[u8]) -> Result<usize, BleConnectorError> {
-        for b in buf {
-            send_hci(&[*b]);
-        }
-        Ok(buf.len())
+        Ok(self.hci_writer.get_mut().write(buf))
+    }
+
+    /// Write to HCI asynchronously.
+    ///
+    /// Returns the number of bytes written, which is at most one packet.
+    #[instability::unstable]
+    pub async fn write_async(&mut self, buf: &[u8]) -> Result<usize, BleConnectorError> {
+        Ok(self.hci_writer.get_mut().write_async(buf).await)
     }
 }
 
@@ -191,8 +219,7 @@ impl embedded_io_async_06::Read for BleConnector<'_> {
 
 impl embedded_io_async_06::Write for BleConnector<'_> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, BleConnectorError> {
-        send_hci(buf);
-        Ok(buf.len())
+        self.write_async(buf).await
     }
 
     async fn flush(&mut self) -> Result<(), BleConnectorError> {
@@ -209,8 +236,7 @@ impl embedded_io_async_07::Read for BleConnector<'_> {
 
 impl embedded_io_async_07::Write for BleConnector<'_> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, BleConnectorError> {
-        send_hci(buf);
-        Ok(buf.len())
+        self.write_async(buf).await
     }
 
     async fn flush(&mut self) -> Result<(), BleConnectorError> {
@@ -225,10 +251,10 @@ impl From<FromHciBytesError> for BleConnectorError {
     }
 }
 
-#[must_use = "futures do nothing unless you `.await` or poll them"]
-pub(crate) struct HciReadyEventFuture;
+/// Completes once any HCI data is available, including a part-read packet.
+pub(crate) struct HciAnyDataReadyEventFuture;
 
-impl core::future::Future for HciReadyEventFuture {
+impl core::future::Future for HciAnyDataReadyEventFuture {
     type Output = ();
 
     fn poll(
@@ -245,28 +271,23 @@ impl core::future::Future for HciReadyEventFuture {
     }
 }
 
-/// The largest HCI packet, including the packet type indicator byte.
-const MAX_HCI_PACKET_LEN: usize = 259;
+/// Completes once the receive queue holds a complete packet.
+pub(crate) struct HciPacketReadyEventFuture;
 
-/// The HCI output of the BLE controller.
-///
-/// The transport implementations use this zero-sized writer to serialize packets directly into the
-/// controller.
-struct HciWriter;
+impl core::future::Future for HciPacketReadyEventFuture {
+    type Output = ();
 
-impl embedded_io_07::ErrorType for HciWriter {
-    type Error = BleConnectorError;
-}
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        HCI_WAKER.register(cx.waker());
 
-impl embedded_io_async_07::Write for HciWriter {
-    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        send_hci(buf);
-        Ok(buf.len())
-    }
-
-    async fn flush(&mut self) -> Result<(), Self::Error> {
-        // nothing to do
-        Ok(())
+        if have_hci_packet() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
     }
 }
 
@@ -286,15 +307,15 @@ fn parse_hci(data: &[u8]) -> Result<ControllerToHostPacket<'_>, BleConnectorErro
     }
 }
 
-/// Waits for a packet from the controller, then reads it into `rx`.
-///
-/// Returns the length of the packet.
-async fn next_packet(rx: &mut [u8]) -> usize {
-    if !have_hci_read_data() {
-        HciReadyEventFuture.await;
-    }
+/// Waits for a packet from the controller, then removes it from the receive queue.
+async fn next_packet() -> Box<[u8]> {
+    loop {
+        HciPacketReadyEventFuture.await;
 
-    read_next(rx)
+        if let Some(packet) = take_next() {
+            return packet;
+        }
+    }
 }
 
 impl bt_hci::transport::Transport for BleConnector<'_> {
@@ -304,14 +325,17 @@ impl bt_hci::transport::Transport for BleConnector<'_> {
         // Safety: we only return a reference to x once, if parsing is successful.
         let rx = unsafe { &mut *core::ptr::slice_from_raw_parts_mut(rx.as_mut_ptr(), rx.len()) };
 
-        let len = next_packet(rx).await;
+        // `ControllerToHostPacket` borrows `rx`, so the packet has to be copied there.
+        HciPacketReadyEventFuture.await;
+        let len = read_next(rx);
         parse_hci(&rx[..len])
     }
 
     /// Write a complete HCI packet from the tx buffer
     async fn write<T: HostToControllerPacket>(&self, val: &T) -> Result<(), Self::Error> {
+        let mut writer = self.hci_writer.lock().await;
         bt_hci::transport::WithIndicator::new(val)
-            .write_hci_async(HciWriter)
+            .write_hci_async(&mut *writer)
             .await
     }
 }
@@ -319,20 +343,20 @@ impl bt_hci::transport::Transport for BleConnector<'_> {
 impl bt_hci_transport::Transport for BleConnector<'_> {
     /// Read a complete HCI packet into the rx buffer
     async fn read<'a, P: PacketToHost<'a>>(&self, rx: &'a mut [u8]) -> Result<P, Self::Error> {
-        // `P::read_hci` deserializes from a reader into `rx`, so the packet must be read into a
-        // buffer other than `rx`.
-        let mut packet = [0; MAX_HCI_PACKET_LEN];
-        let len = next_packet(&mut packet).await;
+        // `P::read_hci` deserializes from a reader into `rx`, so the packet must be read from a
+        // buffer other than `rx`. The queued packet itself is that buffer.
+        let packet = next_packet().await;
 
-        let mut reader = &packet[..len];
+        let mut reader = &packet[..];
         let kind = PacketKind::read(&mut reader)?;
         Ok(P::read_hci(kind, &mut reader, rx)?)
     }
 
     /// Write a complete HCI packet from the tx buffer
     async fn write<P: PacketToController>(&self, tx: &P) -> Result<(), Self::Error> {
+        let mut writer = self.hci_writer.lock().await;
         bt_hci_transport::WithIndicator::new(tx)
-            .write_hci_async(HciWriter)
+            .write_hci_async(&mut *writer)
             .await
     }
 }

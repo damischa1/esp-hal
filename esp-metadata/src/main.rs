@@ -61,7 +61,11 @@ fn generate(workspace: &Path, check: bool) -> Result<()> {
             bail!("Checking the generated code needs `cargo +nightly fmt`, which is not available");
         }
 
-        log::debug!("`cargo +nightly fmt` is not available, only refreshing the metadata cache");
+        log::warn!(
+            "`cargo +nightly fmt` is not available; skipping code generation and only \
+             refreshing the metadata cache. Install a nightly toolchain with the rustfmt \
+             component, then re-run `cargo update-metadata`."
+        );
         dump_cache(workspace)?;
 
         return Ok(());
@@ -92,14 +96,19 @@ fn generate(workspace: &Path, check: bool) -> Result<()> {
     dump_cache(workspace)?;
 
     if check {
+        // The README tables are generated from the same inputs, so a stale
+        // README is as much a failure as stale generated code.
+        let paths = ["esp-metadata-generated", "esp-hal/README.md"];
         let res = Command::new("git")
-            .args(["diff", "HEAD", "esp-metadata-generated"])
+            .args(["diff", "HEAD", "--"])
+            .args(paths)
             .current_dir(workspace)
             .output()
-            .context("Failed to run `git diff HEAD esp-metadata-generated`")?;
+            .context("Failed to run `git diff HEAD`")?;
         if !res.stdout.is_empty() {
             bail!(
-                "detected `esp-metadata-generated` changes. Run `cargo update-metadata`, and commit the changes."
+                "detected changes in {}. Run `cargo update-metadata`, and commit the changes.",
+                paths.join(" and ")
             );
         }
     }

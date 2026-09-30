@@ -235,6 +235,8 @@ string_enum! {
         Esp32c61 = "esp32c61",
         /// ESP32-H2
         Esp32h2 = "esp32h2",
+        /// ESP32-H4
+        Esp32h4 = "esp32h4",
         /// ESP32-P4 (chip revision v3.x / eco5 only)
         Esp32p4 = "esp32p4",
         /// ESP32-S2
@@ -300,6 +302,7 @@ impl Chip {
             Chip::Esp32c6 => "Esp32c6",
             Chip::Esp32c61 => "Esp32c61",
             Chip::Esp32h2 => "Esp32h2",
+            Chip::Esp32h4 => "Esp32h4",
             Chip::Esp32p4 => "Esp32p4",
             Chip::Esp32s2 => "Esp32s2",
             Chip::Esp32s3 => "Esp32s3",
@@ -316,6 +319,7 @@ impl Chip {
             Chip::Esp32c6 => "ESP32-C6",
             Chip::Esp32c61 => "ESP32-C61",
             Chip::Esp32h2 => "ESP32-H2",
+            Chip::Esp32h4 => "ESP32-H4",
             Chip::Esp32p4 => "ESP32-P4",
             Chip::Esp32s2 => "ESP32-S2",
             Chip::Esp32s3 => "ESP32-S3",
@@ -418,6 +422,8 @@ struct Device {
     cores: usize,
     datasheet: String,
     trm: String,
+    #[serde(default)]
+    support_note: String,
 
     // Peripheral driver configuration:
     #[serde(flatten)]
@@ -452,6 +458,7 @@ impl Config {
             Chip::Esp32c6 => cached_device_config!("devices/esp32c6/soc.toml"),
             Chip::Esp32c61 => cached_device_config!("devices/esp32c61/soc.toml"),
             Chip::Esp32h2 => cached_device_config!("devices/esp32h2/soc.toml"),
+            Chip::Esp32h4 => cached_device_config!("devices/esp32h4/soc.toml"),
             Chip::Esp32p4 => cached_device_config!("devices/esp32p4/soc.toml"),
             Chip::Esp32s2 => cached_device_config!("devices/esp32s2/soc.toml"),
             Chip::Esp32s3 => cached_device_config!("devices/esp32s3/soc.toml"),
@@ -470,6 +477,7 @@ impl Config {
                 datasheet: String::new(),
                 trm: String::new(),
                 peri_config: PeriConfig::default(),
+                support_note: String::new(),
             },
             all_symbols: OnceLock::new(),
         }
@@ -730,6 +738,12 @@ impl Config {
         if let Some(peri) = self.device.peri_config.spi_slave.as_ref() {
             tokens.extend(cfg::generate_spi_slave_peripherals(peri));
         };
+        if let Some(peri) = self.device.peri_config.pcnt.as_ref() {
+            tokens.extend(cfg::generate_pcnt_peripherals(peri));
+        };
+        if let Some(peri) = self.device.peri_config.canfd.as_ref() {
+            tokens.extend(cfg::generate_canfd_peripherals(peri));
+        };
 
         tokens.extend(self.generate_peripherals_macro());
 
@@ -781,7 +795,16 @@ This pin may be available with certain limitations. Check your hardware to make 
                     #(#[doc = #docs])* #pin <= virtual ()
                 };
                 all_peripherals.push(quote! { @peri_type #tokens });
-                singleton_peripherals.push(quote! { #pin });
+
+                // The pin type is always defined - drivers and the `for_each_gpio` family of
+                // macros refer to it unconditionally. Only the `Peripherals` field is hidden, so
+                // that an application cannot safely take a pin the crystal is driving.
+                let cfg = if gpio.is_xtal32k() {
+                    quote! { #[cfg(not(use_xtal32k))] }
+                } else {
+                    quote! {}
+                };
+                singleton_peripherals.push(stable_singleton(&cfg, &pin));
             }
         }
 
@@ -819,8 +842,38 @@ This pin may be available with certain limitations. Check your hardware to make 
                         #[doc = #singleton_doc] #ch_name <= #pac ( #(#interrupts),* )
                     };
                     all_peripherals.push(quote! { @peri_type #tokens (unstable) });
-                    singleton_peripherals.push(quote! { #ch_name (unstable) });
+                    singleton_peripherals.push(unstable_singleton(&quote! {}, &ch_name));
                 }
+            }
+        }
+
+        if let Some(pcnt) = self.device.peri_config.pcnt.as_ref()
+            && pcnt.support_status.is_supported()
+        {
+            for instance in pcnt.instances.iter() {
+                for unit in 0..instance.instance_config.units.len() {
+                    let name = format_ident!("{}", cfg::singleton_name(&instance.name, unit));
+                    let singleton_doc = format!("{} peripheral singleton", name);
+                    let tokens = quote! {
+                        #[doc = #singleton_doc] #name <= virtual ()
+                    };
+                    all_peripherals.push(quote! { @peri_type #tokens (unstable) });
+                    singleton_peripherals.push(unstable_singleton(&quote! {}, &name));
+                }
+            }
+        }
+
+        if let Some(sdm) = self.device.peri_config.sdm.as_ref()
+            && sdm.support_status.is_supported()
+        {
+            for channel in 0..sdm.channel_count.count {
+                let ch_name = format_ident!("SDM_CH{channel}");
+                let singleton_doc = format!("SDM_CH{channel} peripheral singleton");
+                let tokens = quote! {
+                    #[doc = #singleton_doc] #ch_name <= virtual ()
+                };
+                all_peripherals.push(quote! { @peri_type #tokens (unstable) });
+                singleton_peripherals.push(unstable_singleton(&quote! {}, &ch_name));
             }
         }
 
@@ -851,12 +904,12 @@ This pin may be available with certain limitations. Check your hardware to make 
             {
                 all_peripherals.push(quote! { @peri_type #tokens });
                 if !peri.hidden {
-                    singleton_peripherals.push(quote! { #hal });
+                    singleton_peripherals.push(stable_singleton(&quote! {}, &hal));
                 }
             } else {
                 all_peripherals.push(quote! { @peri_type #tokens (unstable) });
                 if !peri.hidden {
-                    singleton_peripherals.push(quote! { #hal (unstable) });
+                    singleton_peripherals.push(unstable_singleton(&quote! {}, &hal));
                 }
             }
         }
@@ -924,6 +977,17 @@ This pin may be available with certain limitations. Check your hardware to make 
             .map(|cfg| format!("cargo:rustc-cfg={cfg}"))
             .collect()
     }
+}
+
+// A stable entry of the `singletons` branch of `for_each_peripheral!`.
+fn stable_singleton(cfg: &TokenStream, name: &proc_macro2::Ident) -> TokenStream {
+    quote! { #cfg #name }
+}
+
+// An unstable entry of the `singletons` branch of `for_each_peripheral!`.
+// `cfg` is repeated due to a rust limitation.
+fn unstable_singleton(cfg: &TokenStream, name: &proc_macro2::Ident) -> TokenStream {
+    quote! { #cfg #name (unstable #cfg) }
 }
 
 type Branch<'a> = (&'a str, &'a [TokenStream]);
@@ -1470,16 +1534,73 @@ pub fn generate_lib_rs() -> TokenStream {
 }
 
 pub fn generate_chip_support_status(output: &mut impl Write) -> std::fmt::Result {
+    // The legend applies to every table, so it is written once, before the
+    // first one.
+    SupportStatusLevel::write_legend(output)?;
+    writeln!(output)?;
+
+    let visible = PeriConfig::drivers()
+        .iter()
+        .filter(|driver| !driver.hide_from_peri_table)
+        .collect::<Vec<_>>();
+
+    // A group is written where its first driver is declared, so the order of
+    // the tables is controlled by the order of the driver definitions.
+    let mut groups = Vec::new();
+    for driver in visible.iter() {
+        if !groups.contains(&driver.group) {
+            groups.push(driver.group);
+        }
+    }
+
+    let mut issues = Vec::new();
+    for group in groups {
+        let drivers = visible
+            .iter()
+            .filter(|driver| driver.group == group)
+            .copied()
+            .collect::<Vec<_>>();
+
+        writeln!(output, "### {group}")?;
+        writeln!(output)?;
+        write_support_table(output, &drivers, &mut issues)?;
+        writeln!(output)?;
+    }
+
+    // Print issue link definitions
+    issues.sort();
+    issues.dedup();
+
+    if !issues.is_empty() {
+        writeln!(
+            output,
+            "[^1]: This cell is clickable and will open the peripheral's issue on GitHub"
+        )?;
+        writeln!(output)?;
+    }
+    for issue in issues {
+        writeln!(
+            output,
+            "[{issue}]: https://github.com/esp-rs/esp-hal/issues/{issue}"
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Writes the support table of a single driver group, and collects the issues
+/// its cells link to.
+fn write_support_table(
+    output: &mut impl Write,
+    drivers: &[&SupportItem],
+    issues: &mut Vec<u32>,
+) -> std::fmt::Result {
     let nothing = "";
 
-    // Calculate the width of the first column.
+    // The width of the first column is calculated per table, so that adding a
+    // driver only reflows the table it is added to.
     let driver_col_width = std::iter::once("Driver")
-        .chain(
-            PeriConfig::drivers()
-                .iter()
-                .filter(|i| !i.hide_from_peri_table)
-                .map(|i| i.name),
-        )
+        .chain(drivers.iter().map(|driver| driver.name))
         .map(|c| c.len())
         .max()
         .unwrap();
@@ -1503,16 +1624,10 @@ pub fn generate_chip_support_status(output: &mut impl Write) -> std::fmt::Result
     writeln!(output)?;
 
     // Driver support status
-    let mut issues = Vec::new();
     for SupportItem {
-        name,
-        config_group,
-        hide_from_peri_table,
-    } in PeriConfig::drivers()
+        name, config_group, ..
+    } in drivers
     {
-        if *hide_from_peri_table {
-            continue;
-        }
         write!(output, "| {name:driver_col_width$} |")?;
         for chip in Chip::iter() {
             let config = Config::for_chip(&chip);
@@ -1532,48 +1647,21 @@ pub fn generate_chip_support_status(output: &mut impl Write) -> std::fmt::Result
         writeln!(output)?;
     }
 
-    writeln!(output)?;
-    SupportStatusLevel::write_legend(output)?;
-    writeln!(output)?;
-
-    // Print issue link definitions
-    issues.sort();
-    issues.dedup();
-
-    if !issues.is_empty() {
-        writeln!(
-            output,
-            "[^1]: This cell is clickable and will open the peripheral's issue on GitHub"
-        )?;
-        writeln!(output)?;
-    }
-    for issue in issues {
-        writeln!(
-            output,
-            "[{issue}]: https://github.com/esp-rs/esp-hal/issues/{issue}"
-        )?;
-    }
-
     Ok(())
 }
 
 pub fn generate_supported_devices_table(output: &mut impl Write) -> std::fmt::Result {
-    writeln!(
-        output,
-        "| Chip | Datasheet | Technical Reference Manual | Target |"
-    )?;
-    writeln!(
-        output,
-        "| :---: | :-------: | :------------------------: | :----: |"
-    )?;
+    writeln!(output, "| Chip  | Documentation | Target | Note  |")?;
+    writeln!(output, "| :---: | :-----------: | :----: | :---: |")?;
 
     for chip in Chip::iter() {
         let config = Config::for_chip(&chip);
         writeln!(
             output,
-            "| {pretty} | [{pretty}][{chip}-datasheet] | [{pretty}][{chip}-trm] | `{target}` |",
+            "| {pretty} | [Datasheet][{chip}-datasheet] [TRM][{chip}-trm] | `{target}` | {note} |",
             pretty = chip.pretty_name(),
             target = config.device.target,
+            note = config.device.support_note,
         )?;
     }
 
@@ -1581,8 +1669,8 @@ pub fn generate_supported_devices_table(output: &mut impl Write) -> std::fmt::Re
 
     for chip in Chip::iter() {
         let config = Config::for_chip(&chip);
-        writeln!(output, "[{chip}-datasheet]: {}", config.device.datasheet,)?;
-        writeln!(output, "[{chip}-trm]: {}", config.device.trm,)?;
+        writeln!(output, "[{chip}-datasheet]: {}", config.device.datasheet)?;
+        writeln!(output, "[{chip}-trm]: {}", config.device.trm)?;
     }
 
     Ok(())

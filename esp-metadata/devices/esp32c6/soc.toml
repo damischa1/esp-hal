@@ -17,6 +17,9 @@ trm    = "https://www.espressif.com/sites/default/files/documentation/esp32-c6_t
 page_size = 0x10000
 entry_num = 256
 
+[device.flash]
+support_status = "partial"
+
 [device.rom]
 has_crc_le  = true
 has_crc_be  = true
@@ -41,20 +44,21 @@ peripherals = [
     { name = "APB_SARADC" },
     { name = "ASSIST_DEBUG" },
     { name = "ATOMIC" },
+    { name = "CLINT", hidden = true },
     { name = "DMA" },
     { name = "DS" },
     { name = "ECC" },
     { name = "EFUSE", hidden = true },
     { name = "EXTMEM" },
     { name = "GPIO" },
-    { name = "GPIO_SD" },
+    { name = "GPIO_SD", clock_group = "SDM" },
     { name = "HINF" },
     { name = "HMAC" },
     { name = "HP_APM" },
     { name = "HP_SYS" },
     { name = "I2C_ANA_MST" },
     { name = "I2C0", interrupts = { peri = "I2C_EXT0" }, stable = true, clock_group = "I2C" },
-    { name = "I2S0", interrupts = { peri = "I2S0" } },
+    { name = "I2S0", interrupts = { peri = "I2S0" }, clock_group = "I2S" },
     { name = "IEEE802154", interrupts = { mac = "ZB_MAC" } },
     { name = "INTERRUPT_CORE0" },
     { name = "INTPRI" },
@@ -81,7 +85,7 @@ peripherals = [
     { name = "OTP_DEBUG" },
     { name = "PARL_IO", interrupts = { peri = "PARL_IO" }, clock_group = "PARL_IO" },
     { name = "PAU" },
-    { name = "PCNT" },
+    { name = "PCNT", interrupts = { peri = "PCNT" } },
     { name = "PCR" },
     { name = "PLIC_MX" },
     { name = "PMU" },
@@ -112,9 +116,12 @@ peripherals = [
     { name = "FLASH", virtual = true },
     { name = "GPIO_DEDICATED", virtual = true },
     { name = "LP_CORE", virtual = true },
-    { name = "SW_INTERRUPT", virtual = true },
     { name = "TSENS", virtual = true },
     { name = "WIFI", virtual = true, interrupts = { bb = "WIFI_BB", mac = "WIFI_MAC", pwr = "WIFI_PWR", modem_peri_timeout = "MODEM_PERI_TIMEOUT" }, stable = true },
+    { name = "FROM_CPU_INTR0", virtual = true, hidden = true },
+    { name = "FROM_CPU_INTR1", virtual = true },
+    { name = "FROM_CPU_INTR2", virtual = true },
+    { name = "FROM_CPU_INTR3", virtual = true },
 ]
 
 [device.soc.clocks]
@@ -196,7 +203,7 @@ channels = [["CPU_GPIO_0", "CPU_GPIO_1", "CPU_GPIO_2", "CPU_GPIO_3", "CPU_GPIO_4
 
 [device.i2c_master]
 support_status = "supported"
-version = 3
+version = 4
 instances = [
     { name = "i2c0", sys_instance = "I2cExt0", scl = "I2CEXT0_SCL", sda = "I2CEXT0_SDA" },
 ]
@@ -220,7 +227,7 @@ version = "lp_i2c"
 fifo_size = 16
 
 [device.i2c_slave]
-support_status = "supported"
+support_status = "partial"
 instances = [
     { name = "i2c0" },
 ]
@@ -229,7 +236,8 @@ instances = [
 support_status = "partial"
 status_registers = 3
 software_interrupt_count = 4
-controller = { Riscv = { flavour = "plic", interrupts = 32, priority_levels = 15 } }
+controller = { Riscv = { flavour = "plic", interrupts = 32, priority_levels = 15, context_switch_interrupt = true } }
+context_switch_source = "clint"
 
 [device.rmt]
 support_status = "partial"
@@ -255,7 +263,8 @@ support_status = "partial"
 algo = { sha1 = 0, sha224 = 1, sha256 = 2 }
 
 [device.sdm]
-support_status = { status = "not_supported", issue = 2370 }
+support_status = "partial"
+channel_count = 4
 
 [device.spi_master]
 version = 3
@@ -323,6 +332,8 @@ is_lp_sys = true
 support_status = "partial"
 light_sleep = true
 deep_sleep = true
+ext1_version = 2
+pin_wakeup_version = 3
 wakeup_sources = {
     Ext1 = 1,
     Gpio = 2,
@@ -348,7 +359,6 @@ version = 1
 ## Interfaces
 [device.i2s]
 version = 2
-default_clock_source = 2
 mclk_divider_bit_width = 9
 max_ws_width = 128
 clock_configured_by_pcr = true
@@ -375,6 +385,18 @@ channel_count = 6
 [device.mcpwm]
 
 [device.pcnt]
+instances = {
+    PCNT = {
+        sys_instance = "Pcnt",
+        interrupt = "PCNT",
+        units = [
+            { sig_ch0 = "PCNT0_SIG_CH0", sig_ch1 = "PCNT0_SIG_CH1", ctrl_ch0 = "PCNT0_CTRL_CH0", ctrl_ch1 = "PCNT0_CTRL_CH1" },
+            { sig_ch0 = "PCNT1_SIG_CH0", sig_ch1 = "PCNT1_SIG_CH1", ctrl_ch0 = "PCNT1_CTRL_CH0", ctrl_ch1 = "PCNT1_CTRL_CH1" },
+            { sig_ch0 = "PCNT2_SIG_CH0", sig_ch1 = "PCNT2_SIG_CH1", ctrl_ch0 = "PCNT2_CTRL_CH0", ctrl_ch1 = "PCNT2_CTRL_CH1" },
+            { sig_ch0 = "PCNT3_SIG_CH0", sig_ch1 = "PCNT3_SIG_CH1", ctrl_ch0 = "PCNT3_CTRL_CH0", ctrl_ch1 = "PCNT3_CTRL_CH1" },
+        ],
+    },
+}
 [device.sd_slave]
 support_status = "not_supported"
 [device.twai]

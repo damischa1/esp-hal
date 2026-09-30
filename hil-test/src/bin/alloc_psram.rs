@@ -1,11 +1,12 @@
 //! Allocator and PSRAM-related tests
 
-//% CHIP_FILTER(llff, tlsf): psram_driver_supported && !soc_has_flash
-//% CHIP_FILTER(llff_with_storage, tlsf_with_storage): psram_driver_supported && soc_has_flash
-//% ENV(llff, llff_with_storage): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=LLFF
-//% ENV(tlsf, tlsf_with_storage): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=TLSF
+//% CHIP_FILTER(llff, tlsf): psram_driver_supported
+//% ENV(llff): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=LLFF
+//% ENV(tlsf): ESP_ALLOC_CONFIG_HEAP_ALGORITHM=TLSF
+// The default 64KB leaves nothing to reclaim, see the dcache_reclaimed tests below.
+//% ENV-IF(esp32s3): ESP_HAL_CONFIG_DATA_CACHE_SIZE=32KB
 //% FEATURES: unstable esp-alloc/nightly
-//% FEATURES(llff_with_storage, tlsf_with_storage): esp-storage
+//% FEATURES-IF(soc_has_flash): esp-storage
 
 #![no_std]
 #![no_main]
@@ -140,11 +141,40 @@ mod tests {
     }
 }
 
+/// Only the ESP32-S3 can hand unused data cache to the allocator, and only as much of it
+/// as `ESP_HAL_CONFIG_DATA_CACHE_SIZE` leaves unused.
+#[cfg(feature = "esp32s3")]
+#[embedded_test::tests]
+mod dcache_reclaimed {
+    use esp_hal::{clock::CpuClock, ram};
+
+    #[init]
+    fn init() {
+        let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+        let _p = esp_hal::init(config);
+
+        esp_alloc::heap_allocator!(#[ram(unstable(dcache_reclaimed))] size: 32 * 1024);
+    }
+
+    #[test]
+    fn reclaimed_dcache_is_usable() {
+        let mut vec = alloc::vec::Vec::with_capacity(16384);
+
+        for i in 0..16384 {
+            vec.push((i % 256) as u8);
+        }
+
+        for i in 0..16384 {
+            assert_eq!(vec[i], (i % 256) as u8);
+        }
+    }
+}
+
 #[cfg(feature = "esp-storage")]
 #[embedded_test::tests]
 mod storage_tests {
     use esp_bootloader_esp_idf::partitions;
-    use esp_hal::peripherals::FLASH;
+    use esp_hal::{clock::CpuClock, peripherals::FLASH};
     use esp_storage::FlashStorage;
 
     struct Context<'a> {
@@ -153,7 +183,8 @@ mod storage_tests {
 
     #[init]
     fn init() -> Context<'static> {
-        let p = esp_hal::init(esp_hal::Config::default());
+        let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+        let p = esp_hal::init(config);
         esp_alloc::psram_allocator!(p.PSRAM, esp_hal::psram);
 
         Context { flash: p.FLASH }

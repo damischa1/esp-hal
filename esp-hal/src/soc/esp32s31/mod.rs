@@ -13,12 +13,6 @@ pub(crate) mod regi2c;
 
 pub(crate) use esp32s31 as pac;
 
-#[cfg(i2s_driver_supported)]
-#[cfg_attr(not(feature = "unstable"), allow(unused))]
-pub(crate) fn i2s_sclk_frequency() -> u32 {
-    clocks::pll_f160m_frequency()
-}
-
 pub(crate) fn enable_branch_predictor() {
     // Enable branch predictor.
     // Note that the branch predictor will start cache requests and needs to be
@@ -30,6 +24,17 @@ pub(crate) fn enable_branch_predictor() {
     const MHCR_BTB: u32 = 1 << 12; // R/W, branch target prediction enable bit
     unsafe {
         core::arch::asm!("csrrs x0, 0x7c1, {0}", in(reg) MHCR_RS | MHCR_BFE | MHCR_BTB);
+    }
+}
+
+#[cfg(feature = "unstable")]
+pub(crate) fn disable_branch_predictor() {
+    // Clears the bits set by `enable_branch_predictor`.
+    const MHCR_RS: u32 = 1 << 4;
+    const MHCR_BFE: u32 = 1 << 5;
+    const MHCR_BTB: u32 = 1 << 12;
+    unsafe {
+        core::arch::asm!("csrrc x0, 0x7c1, {0}", in(reg) MHCR_RS | MHCR_BFE | MHCR_BTB);
     }
 }
 
@@ -92,5 +97,31 @@ fn write_pms_ctrl_range(base: usize, start: usize, end: usize) {
             (base as *mut u32).add(offset / 4).write_volatile(OPEN);
         }
         offset += 4;
+    }
+}
+
+const CACHE_MAP_L1_DCACHE: u32 = 1 << 4;
+
+/// Writes back a specific range of data in the cache.
+#[doc(hidden)]
+#[crate::ram]
+pub unsafe fn cache_writeback_addr(addr: u32, size: u32) {
+    unsafe extern "C" {
+        fn Cache_WriteBack_Addr(map: u32, addr: u32, size: u32);
+    }
+    unsafe {
+        Cache_WriteBack_Addr(CACHE_MAP_L1_DCACHE, addr, size);
+    }
+}
+
+/// Invalidate a specific range of addresses in the cache.
+#[doc(hidden)]
+#[crate::ram]
+pub unsafe fn cache_invalidate_addr(addr: u32, size: u32) {
+    unsafe extern "C" {
+        fn Cache_Invalidate_Addr(map: u32, addr: u32, size: u32);
+    }
+    unsafe {
+        Cache_Invalidate_Addr(CACHE_MAP_L1_DCACHE, addr, size);
     }
 }
